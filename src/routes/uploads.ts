@@ -1,8 +1,7 @@
 import { Request, Response, Router } from 'express';
-import { existsSync, mkdirSync, unlinkSync } from 'fs';
-import path from 'path';
 import multer from 'multer';
 import crypto from 'crypto';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { query } from '../db';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth';
 import { ConversationRow } from '../types';
@@ -12,21 +11,19 @@ import { getParticipantById, requireParticipant } from '../helpers/conversations
 const router = Router();
 router.use(requireAuth);
 
-export const uploadsDir = path.resolve(process.cwd(), 'uploads');
-const avatarsDir = path.join(uploadsDir, 'avatars');
+const BUCKET = 'avatars';
 
-mkdirSync(avatarsDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, avatarsDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-    cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
-  },
-});
+function storageClient(): SupabaseClient {
+  const url = process.env.VITE_SUPABASE_URL ?? process.env.SUPABASE_URL;
+  const serviceRole = process.env.VITE_SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceRole) {
+    throw new HttpError(500, 'Storage is not configured (VITE_SUPABASE_URL / VITE_SUPABASE_SERVICE_ROLE_KEY)');
+  }
+  return createClient(url, serviceRole, { auth: { persistSession: false } });
+}
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype.startsWith('image/')) cb(null, true);
@@ -34,16 +31,29 @@ const upload = multer({
   },
 });
 
-function deleteOldAvatar(avatarUrl: string | null): void {
-  if (!avatarUrl || !avatarUrl.startsWith('/uploads/avatars/')) return;
-  const filename = path.basename(avatarUrl);
-  const file = path.join(avatarsDir, filename);
-  if (existsSync(file)) {
-    try {
-      unlinkSync(file);
-    } catch {
-      /* ignore */
-    }
+async function uploadAvatar(buffer: Buffer, mimetype: string, originalName: string, pathPrefix: string): Promise<string> {
+  const ext = (require('path').extname(originalName).toLowerCase() || '.jpg').replace(/[^.a-z0-9]/g, '');
+  const name = `${pathPrefix}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+  const sb = storageClient();
+  const { error } = await sb.storage.from(BUCKET).upload(name, buffer, {
+    contentType: mimetype,
+    upsert: false,
+  });
+  if (error) throw new HttpError(500, `Upload failed: ${error.message}`);
+  return sb.storage.from(BUCKET).getPublicUrl(name).data.publicUrl;
+}
+
+async function deleteAvatar(avatarUrl: string | null | undefined): Promise<void> {
+  if (!avatarUrl) return;
+  const marker = `/storage/v1/object/public/${BUCKET}/`;
+  const idx = avatarUrl.indexOf(marker);
+  if (idx < 0) return;
+  const name = avatarUrl.slice(idx + marker.length);
+  if (!name) return;
+  try {
+    await storageClient().storage.from(BUCKET).remove([name]);
+  } catch {
+    /* ignore */
   }
 }
 
@@ -58,10 +68,9 @@ router.post(
     const { rows } = await query<{ avatar_url: string | null }>('SELECT avatar_url FROM users WHERE id = $1', [
       userId,
     ]);
-    deleteOldAvatar(rows[0]?.avatar_url ?? null);
-
-    const url = `/uploads/avatars/${req.file.filename}`;
+    const url = await uploadAvatar(req.file.buffer, req.file.mimetype, req.file.originalname, `user-${userId}`);
     await query('UPDATE users SET avatar_url = $1 WHERE id = $2', [url, userId]);
+    await deleteAvatar(rows[0]?.avatar_url ?? null);
     res.status(201).json({ avatar_url: url });
   },
 );
@@ -78,9 +87,9 @@ router.post(
     const me = await getParticipantById(conversation.id, userId);
     if (!me || me.role !== 'admin') throw new HttpError(403, 'Only admins can change the group photo');
 
-    deleteOldAvatar(conversation.avatar_url);
-    const url = `/uploads/avatars/${req.file.filename}`;
+    const url = await uploadAvatar(req.file.buffer, req.file.mimetype, req.file.originalname, `conv-${conversation.id}`);
     await query('UPDATE conversations SET avatar_url = $1 WHERE id = $2', [url, conversation.id]);
+    await deleteAvatar(conversation.avatar_url);
     res.status(201).json({ avatar_url: url });
   },
 );

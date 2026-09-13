@@ -11,7 +11,7 @@ import usersRouter from './routes/users';
 import conversationsRouter from './routes/conversations';
 import messagesRouter from './routes/messages';
 import statusesRouter from './routes/statuses';
-import uploadsRouter, { uploadsDir } from './routes/uploads';
+import uploadsRouter from './routes/uploads';
 
 dotenv.config();
 
@@ -27,9 +27,6 @@ app.use(
   }),
 );
 app.use(express.json({ limit: '2mb' }));
-
-// serve uploaded avatars at /uploads/...
-app.use('/uploads', express.static(uploadsDir));
 
 app.get('/health', async (_req: Request, res: Response) => {
   try {
