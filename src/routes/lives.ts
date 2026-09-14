@@ -4,7 +4,7 @@ import { requireAuth, AuthenticatedRequest } from '../middleware/auth';
 import { LiveRow } from '../types';
 import { asyncHandler, HttpError, trimString } from '../utils';
 import { liveRecipients, serializeLive, LivePayload } from '../helpers/lives';
-import { emitToUsers, registerLiveHost, getLiveViewerCount, endLive } from '../socket';
+import { emitToUsers, registerLiveHost, getLiveViewerCount, endLive, getLiveComments } from '../socket';
 
 const router = Router();
 router.use(requireAuth);
@@ -38,6 +38,22 @@ router.get(
       rows.map((r) => serializeLive(r, getLiveViewerCount(r.id))),
     );
     res.json({ lives });
+  }),
+);
+
+// GET /api/live/:id/comments?limit=50 -> recent ephemeral comments for this live
+router.get(
+  '/:id/comments',
+  asyncHandler(async (req, res) => {
+    const { userId } = req as AuthenticatedRequest;
+    const liveId = String(req.params.id);
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 100);
+
+    const { rows } = await query<LiveRow>('SELECT * FROM lives WHERE id = $1', [liveId]);
+    if (rows.length === 0) throw new HttpError(404, 'Live not found');
+
+    const comments = getLiveComments(liveId, limit);
+    res.json({ comments });
   }),
 );
 

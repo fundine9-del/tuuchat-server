@@ -89,6 +89,37 @@ export function emitToUsers(event: string, payload: unknown, userIds: string[]):
   }
 }
 
+/* ------------------------- live comments (ephemeral) ------------------------- */
+
+export interface LiveComment {
+  id: string;
+  liveId: string;
+  userId: string;
+  displayName: string;
+  avatarUrl: string | null;
+  content: string;
+  createdAt: string;
+}
+
+const liveComments = new Map<string, LiveComment[]>();
+const LIVE_COMMENT_LIMIT = 100;
+
+function addLiveComment(comment: LiveComment): void {
+  const arr = liveComments.get(comment.liveId) ?? [];
+  arr.push(comment);
+  if (arr.length > LIVE_COMMENT_LIMIT) arr.splice(0, arr.length - LIVE_COMMENT_LIMIT);
+  liveComments.set(comment.liveId, arr);
+}
+
+export function getLiveComments(liveId: string, limit = 50): LiveComment[] {
+  const arr = liveComments.get(liveId) ?? [];
+  return arr.slice(-limit);
+}
+
+function clearLiveComments(liveId: string): void {
+  liveComments.delete(liveId);
+}
+
 /* ------------------------- live broadcast rooms ------------------------- */
 
 interface LiveRoom {
@@ -134,6 +165,7 @@ function notifyViewerCount(liveId: string, hostUserId: string, count: number): v
 export async function endLive(liveId: string): Promise<void> {
   const room = liveRooms.get(liveId);
   liveRooms.delete(liveId);
+  clearLiveComments(liveId);
   await query('UPDATE lives SET status = $2, ended_at = now() WHERE id = $1', [liveId, 'ended']).catch(
     () => undefined,
   );
@@ -310,6 +342,54 @@ export function initSocket(server: HttpServer): Server {
       room.readers.delete(socket.id);
       if ((socket.data as any).liveId === liveId) delete (socket.data as any).liveId;
       if (liveRooms.get(liveId) === room) notifyViewerCount(liveId, room.hostUserId, room.readers.size);
+    });
+
+    socket.on('live:comment', (data: { liveId?: string; content?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      const content = String(data?.content ?? '').trim().slice(0, 500);
+      if (!liveId || !content) return;
+      const room = liveRooms.get(liveId);
+      if (!room) return;
+      const isHost = socket.data.userId === room.hostUserId;
+      const isViewer = room.readers.has(socket.id);
+      if (!isHost && !isViewer) return;
+
+      const senderId = socket.data.userId;
+      const comment: LiveComment = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        liveId,
+        userId: senderId,
+        displayName: '',
+        avatarUrl: null,
+        content,
+        createdAt: new Date().toISOString(),
+      };
+
+      query<{ display_name: string; avatar_url: string | null }>(
+        'SELECT display_name, avatar_url FROM users WHERE id = $1',
+        [senderId],
+      ).then(({ rows }) => {
+        const u = rows[0];
+        if (u) {
+          comment.displayName = u.display_name;
+          comment.avatarUrl = u.avatar_url;
+        }
+        addLiveComment(comment);
+
+        // Emit to all viewers + host
+        if (!io) return;
+        const seen = new Set<string>();
+        const emitTo = (sid: string) => {
+          if (seen.has(sid)) return;
+          seen.add(sid);
+          const sock = io!.sockets.sockets.get(sid);
+          if (sock) sock.emit('live:comment', { liveId, comment });
+        };
+        for (const sid of room.readers.keys()) emitTo(sid);
+        // Also emit to host's sockets
+        const hostSockets = presence.get(room.hostUserId);
+        if (hostSockets) for (const sid of hostSockets) emitTo(sid);
+      }).catch(() => undefined);
     });
 
     socket.on('live:end', (data: { liveId?: string }) => {
