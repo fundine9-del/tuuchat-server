@@ -11,6 +11,7 @@ import usersRouter from './routes/users';
 import conversationsRouter from './routes/conversations';
 import messagesRouter from './routes/messages';
 import statusesRouter from './routes/statuses';
+import livesRouter from './routes/lives';
 import uploadsRouter from './routes/uploads';
 
 dotenv.config();
@@ -41,6 +42,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/conversations', conversationsRouter);
 app.use('/api/statuses', statusesRouter);
+app.use('/api/live', livesRouter);
 app.use('/api', messagesRouter);
 app.use('/api', uploadsRouter);
 

@@ -65,6 +65,15 @@ export interface StatusRow {
   expires_at: Date;
 }
 
+export interface LiveRow {
+  id: string;
+  host_id: string;
+  title: string;
+  status: 'live' | 'ended';
+  started_at: Date;
+  ended_at: Date | null;
+}
+
 export interface JwtPayload {
   sub: string;
   username: string;

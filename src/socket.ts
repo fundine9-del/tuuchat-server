@@ -3,6 +3,7 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { query } from './db';
 import { MessageRow, UserRow } from './types';
+import { liveRecipients } from './helpers/lives';
 
 // userId -> set of socket ids (a user can be connected from several devices)
 const presence = new Map<string, Set<string>>();
@@ -86,6 +87,62 @@ export function emitToUsers(event: string, payload: unknown, userIds: string[]):
       io.to(sid).emit(event, payload);
     }
   }
+}
+
+/* ------------------------- live broadcast rooms ------------------------- */
+
+interface LiveRoom {
+  liveId: string;
+  hostUserId: string;
+  readers: Map<string, string>; // socketId -> userId
+}
+
+const liveRooms = new Map<string, LiveRoom>();
+
+export function registerLiveHost(liveId: string, hostUserId: string): void {
+  const room = liveRooms.get(liveId) ?? { liveId, hostUserId, readers: new Map() };
+  room.hostUserId = hostUserId;
+  liveRooms.set(liveId, room);
+}
+
+export function getLiveViewerCount(liveId: string): number {
+  return liveRooms.get(liveId)?.readers.size ?? 0;
+}
+
+export function unregisterLive(liveId: string): void {
+  liveRooms.delete(liveId);
+}
+
+// Rebuild the in-memory room from the DB if the server restarted mid-live.
+async function ensureLiveRoom(liveId: string): Promise<LiveRoom | undefined> {
+  const existing = liveRooms.get(liveId);
+  if (existing) return existing;
+  const { rows } = await query<{ host_id: string }>(
+    `SELECT host_id FROM lives WHERE id = $1 AND status = 'live'`,
+    [liveId],
+  );
+  if (rows.length === 0) return undefined;
+  const room: LiveRoom = { liveId, hostUserId: rows[0].host_id, readers: new Map() };
+  liveRooms.set(liveId, room);
+  return room;
+}
+
+function notifyViewerCount(liveId: string, hostUserId: string, count: number): void {
+  emitToUsers('live:viewer-count', { liveId, viewers: count }, [hostUserId]);
+}
+
+export async function endLive(liveId: string): Promise<void> {
+  const room = liveRooms.get(liveId);
+  liveRooms.delete(liveId);
+  await query('UPDATE lives SET status = $2, ended_at = now() WHERE id = $1', [liveId, 'ended']).catch(
+    () => undefined,
+  );
+  if (!room) return;
+  if (io) {
+    for (const sid of room.readers.keys()) io.to(sid).emit('live:ended', { liveId });
+  }
+  const recipients = await liveRecipients(room.hostUserId);
+  emitToUsers('live:ended', { liveId }, recipients);
 }
 
 async function loadUserId(token: string | undefined): Promise<string | null> {
@@ -190,8 +247,88 @@ export function initSocket(server: HttpServer): Server {
       });
     }
 
+    // Live broadcast: "watch" viewers register themselves; the host handles
+    // each viewer's offer and answers back routed to that viewer's socket.
+    socket.on('live:watch', async (data: { liveId?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      if (!liveId) return;
+      const room = await ensureLiveRoom(liveId);
+      if (!room) {
+        socket.emit('live:no-such', { liveId });
+        return;
+      }
+      room.readers.set(socket.id, userId);
+      (socket.data as any).liveId = liveId;
+      notifyViewerCount(liveId, room.hostUserId, room.readers.size);
+      socket.emit('live:joined', { liveId, viewers: room.readers.size });
+    });
+
+    socket.on('live:watch-offer', (data: { liveId?: string; sdp?: unknown }) => {
+      const liveId = String(data?.liveId ?? '');
+      const room = liveRooms.get(liveId);
+      if (!room || !data?.sdp) return;
+      emitToUsers(
+        'live:watch-offer',
+        { liveId, sdp: data.sdp, viewerSocketId: socket.id },
+        [room.hostUserId],
+      );
+    });
+
+    socket.on('live:host-answer', (data: { liveId?: string; sdp?: unknown; viewerSocketId?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      const room = liveRooms.get(liveId);
+      if (!room || !data?.sdp || socket.data.userId !== room.hostUserId) return;
+      const sid = String(data.viewerSocketId ?? '');
+      const sock = io?.sockets.sockets.get(sid);
+      if (sock) sock.emit('live:host-answer', { liveId, sdp: data.sdp });
+    });
+
+    socket.on(
+      'live:ice',
+      (data: { liveId?: string; candidate?: unknown; to?: string; viewerSocketId?: string }) => {
+        const liveId = String(data?.liveId ?? '');
+        const room = liveRooms.get(liveId);
+        if (!room || !data?.candidate) return;
+        if (data.to === 'host') {
+          emitToUsers(
+            'live:ice',
+            { liveId, candidate: data.candidate, to: 'host', viewerSocketId: socket.id },
+            [room.hostUserId],
+          );
+        } else if (data.to === 'viewer' && socket.data.userId === room.hostUserId) {
+          const sid = String(data.viewerSocketId ?? '');
+          const sock = io?.sockets.sockets.get(sid);
+          if (sock) sock.emit('live:ice', { liveId, candidate: data.candidate, to: 'viewer' });
+        }
+      },
+    );
+
+    socket.on('live:leave', (data: { liveId?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      const room = liveRooms.get(liveId);
+      if (!room) return;
+      room.readers.delete(socket.id);
+      if ((socket.data as any).liveId === liveId) delete (socket.data as any).liveId;
+      if (liveRooms.get(liveId) === room) notifyViewerCount(liveId, room.hostUserId, room.readers.size);
+    });
+
+    socket.on('live:end', (data: { liveId?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      const room = liveRooms.get(liveId);
+      if (!room || socket.data.userId !== room.hostUserId) return;
+      void endLive(liveId);
+    });
+
     socket.on('disconnect', async () => {
       const set = presence.get(userId);
+      // remove this socket from any live it was watching
+      const watchedLive = (socket.data as any).liveId as string | undefined;
+      if (watchedLive) {
+        const room = liveRooms.get(watchedLive);
+        if (room && room.readers.delete(socket.id)) {
+          notifyViewerCount(watchedLive, room.hostUserId, room.readers.size);
+        }
+      }
       if (set) set.delete(socket.id);
       if (!set || set.size === 0) {
         presence.delete(userId);
@@ -202,6 +339,11 @@ export function initSocket(server: HttpServer): Server {
           status: 'offline',
           last_seen: rows[0]?.last_seen ?? new Date().toISOString(),
         });
+        // a live host going fully offline ends their broadcast(s)
+        const hostLives = [...liveRooms.entries()]
+          .filter(([, r]) => r.hostUserId === userId)
+          .map(([id]) => id);
+        for (const liveId of hostLives) void endLive(liveId);
       }
     });
   });
