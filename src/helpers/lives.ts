@@ -27,9 +27,14 @@ export interface LivePayload {
     avatar_url: string | null;
   };
   viewer_count: number;
+  likes: number;
 }
 
-export async function serializeLive(live: LiveRow, viewerCount: number): Promise<LivePayload> {
+export async function serializeLive(
+  live: LiveRow,
+  viewerCount: number,
+  likes = 0,
+): Promise<LivePayload> {
   const { rows } = await query<{
     id: string;
     username: string;
@@ -49,5 +54,6 @@ export async function serializeLive(live: LiveRow, viewerCount: number): Promise
       avatar_url: host?.avatar_url ?? null,
     },
     viewer_count: viewerCount,
+    likes,
   };
 }

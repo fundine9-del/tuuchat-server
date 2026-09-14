@@ -4,7 +4,7 @@ import { requireAuth, AuthenticatedRequest } from '../middleware/auth';
 import { LiveRow } from '../types';
 import { asyncHandler, HttpError, trimString } from '../utils';
 import { liveRecipients, serializeLive, LivePayload } from '../helpers/lives';
-import { emitToUsers, registerLiveHost, getLiveViewerCount, endLive, getLiveComments } from '../socket';
+import { emitToUsers, registerLiveHost, getLiveViewerCount, getLiveLikes, endLive, getLiveComments } from '../socket';
 
 const router = Router();
 router.use(requireAuth);
@@ -35,9 +35,29 @@ router.get(
     );
 
     const lives: LivePayload[] = await Promise.all(
-      rows.map((r) => serializeLive(r, getLiveViewerCount(r.id))),
+      rows.map((r) => serializeLive(r, getLiveViewerCount(r.id), getLiveLikes(r.id))),
     );
     res.json({ lives });
+  }),
+);
+
+// GET /api/live/:id -> resolve a single live by id (for join-by-link / share)
+router.get(
+  '/:id',
+  asyncHandler(async (req, res) => {
+    const liveId = String(req.params.id);
+    const { rows } = await query<LiveRow>(
+      "SELECT * FROM lives WHERE id = $1 AND status = 'live'",
+      [liveId],
+    );
+    if (rows.length === 0) throw new HttpError(404, 'Live not found');
+    const live = rows[0];
+    const payload: LivePayload = await serializeLive(
+      live,
+      getLiveViewerCount(live.id),
+      getLiveLikes(live.id),
+    );
+    res.json({ live: payload });
   }),
 );
 
@@ -77,7 +97,7 @@ router.post(
     const live = rows[0];
     registerLiveHost(live.id, userId);
 
-    const payload: LivePayload = await serializeLive(live, 0);
+    const payload: LivePayload = await serializeLive(live, 0, 0);
     const recipients = await liveRecipients(userId);
     emitToUsers('live:started', payload, recipients);
     res.status(201).json({ live: payload });

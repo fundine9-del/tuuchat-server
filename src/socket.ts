@@ -126,18 +126,23 @@ interface LiveRoom {
   liveId: string;
   hostUserId: string;
   readers: Map<string, string>; // socketId -> userId
+  likes: number;
 }
 
 const liveRooms = new Map<string, LiveRoom>();
 
 export function registerLiveHost(liveId: string, hostUserId: string): void {
-  const room = liveRooms.get(liveId) ?? { liveId, hostUserId, readers: new Map() };
+  const room = liveRooms.get(liveId) ?? { liveId, hostUserId, readers: new Map(), likes: 0 };
   room.hostUserId = hostUserId;
   liveRooms.set(liveId, room);
 }
 
 export function getLiveViewerCount(liveId: string): number {
   return liveRooms.get(liveId)?.readers.size ?? 0;
+}
+
+export function getLiveLikes(liveId: string): number {
+  return liveRooms.get(liveId)?.likes ?? 0;
 }
 
 export function unregisterLive(liveId: string): void {
@@ -153,7 +158,7 @@ async function ensureLiveRoom(liveId: string): Promise<LiveRoom | undefined> {
     [liveId],
   );
   if (rows.length === 0) return undefined;
-  const room: LiveRoom = { liveId, hostUserId: rows[0].host_id, readers: new Map() };
+  const room: LiveRoom = { liveId, hostUserId: rows[0].host_id, readers: new Map(), likes: 0 };
   liveRooms.set(liveId, room);
   return room;
 }
@@ -390,6 +395,29 @@ export function initSocket(server: HttpServer): Server {
         const hostSockets = presence.get(room.hostUserId);
         if (hostSockets) for (const sid of hostSockets) emitTo(sid);
       }).catch(() => undefined);
+    });
+
+    socket.on('live:like', (data: { liveId?: string }) => {
+      const liveId = String(data?.liveId ?? '');
+      if (!liveId) return;
+      const room = liveRooms.get(liveId);
+      if (!room) return;
+      const isHost = socket.data.userId === room.hostUserId;
+      const isViewer = room.readers.has(socket.id);
+      if (!isHost && !isViewer) return;
+
+      room.likes += 1;
+      if (!io) return;
+      const seen = new Set<string>();
+      const emitTo = (sid: string) => {
+        if (seen.has(sid)) return;
+        seen.add(sid);
+        const sock = io!.sockets.sockets.get(sid);
+        if (sock) sock.emit('live:likes', { liveId, likes: room.likes, by: socket.data.userId });
+      };
+      for (const sid of room.readers.keys()) emitTo(sid);
+      const hostSockets = presence.get(room.hostUserId);
+      if (hostSockets) for (const sid of hostSockets) emitTo(sid);
     });
 
     socket.on('live:end', (data: { liveId?: string }) => {
